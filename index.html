@@ -1030,15 +1030,9 @@
     let autoSyncTimer = null;
     let isSyncing = false;
     let unsubscribeSnapshot = null;
-
-    function getLocalUpdatedAt() { return parseInt(localStorage.getItem('st_updated_at') || '0', 10); }
-    function getLastServerVersion() { return parseInt(localStorage.getItem('st_sync_server_version') || '0', 10); }
-    function isLocalDirty() { return localStorage.getItem('st_sync_local_dirty') === '1'; }
-    function markLocalDirty() { localStorage.setItem('st_sync_local_dirty', '1'); }
-    function markLocalClean(serverVersion) {
-      localStorage.setItem('st_sync_local_dirty', '0');
-      localStorage.setItem('st_sync_server_version', String(serverVersion || 0));
-    }
+    let syncReady = false;
+    let pendingLocalChange = false;
+    let currentSyncRoomId = '';
 
     async function initFirebase() {
       if (db) return db;
@@ -1049,119 +1043,116 @@
         await signInAnonymously(auth);
         return db;
       } catch (e) {
-        console.error('[SYNC] Firebase init error:', e);
+        console.error("[SYNC] Firebase init error:", e);
         return null;
       }
     }
 
     window.updateSyncRoom = function(roomId) {
       roomId = roomId.trim();
+      syncReady = false;
+      pendingLocalChange = false;
+      currentSyncRoomId = roomId;
+
+      if (autoSyncTimer) {
+        clearTimeout(autoSyncTimer);
+        autoSyncTimer = null;
+      }
       localStorage.setItem('st_sync_room', roomId);
-      if (unsubscribeSnapshot) { unsubscribeSnapshot(); unsubscribeSnapshot = null; }
-      if (!roomId) { updateSyncStatus('ローカル保存稼働中', 'text-emerald-600'); return; }
-      setupRealtimeSync(roomId);
+
+      if (unsubscribeSnapshot) {
+        unsubscribeSnapshot();
+        unsubscribeSnapshot = null;
+      }
+
+      if (roomId) {
+        setupRealtimeSync(roomId);
+      } else {
+        updateSyncStatus('ローカル保存稼働中', 'text-emerald-600');
+      }
     };
 
     async function setupRealtimeSync(roomId) {
       const database = await initFirebase();
-      if (!database) { updateSyncStatus('❌ クラウド接続エラー', 'text-rose-500'); return; }
-      if (unsubscribeSnapshot) { unsubscribeSnapshot(); unsubscribeSnapshot = null; }
+      if (!database) {
+        updateSyncStatus('❌ クラウド接続エラー', 'text-rose-500');
+        return;
+      }
 
-      updateSyncStatus('☁️ サーバーの変更を確認中...', 'text-indigo-500');
-      console.log('[SYNC] 接続開始:', roomId);
+      syncReady = false;
+      pendingLocalChange = false;
+      currentSyncRoomId = roomId;
+
+      if (unsubscribeSnapshot) {
+        unsubscribeSnapshot();
+        unsubscribeSnapshot = null;
+      }
+
+      updateSyncStatus('☁️ サーバーデータを確認中...', 'text-indigo-500');
+      console.log("[SYNC] 初回接続: 読み込みのみ。push禁止");
+
       const docRef = doc(database, 'rooms', roomId);
-      const initializedKey = 'st_sync_initialized_' + roomId;
-      const firstConnection = localStorage.getItem(initializedKey) !== '1';
+      let docSnap;
 
-      // 初回接続は読み込み確認だけ。ここからpushしない。
       try {
-        const docSnap = await getDoc(docRef);
+        docSnap = await getDoc(docRef);
+
         if (docSnap.exists()) {
           const remoteData = docSnap.data();
           const remoteUpdatedAt = Number(remoteData.updatedAt || 0);
-          const knownServerVersion = getLastServerVersion();
-          console.log('[SYNC] 接続時確認:', { firstConnection, remoteUpdatedAt, knownServerVersion, localDirty: isLocalDirty() });
 
-          if (firstConnection) {
-            // 既存ローカルを安全のため退避してから、サーバーを読み込む。
-            saveLocalConflictBackup('first-connection');
-            if (remoteUpdatedAt > 0) applyRemoteData(remoteData, remoteUpdatedAt);
-            localStorage.setItem(initializedKey, '1');
-            console.log('[SYNC] 初回接続：読み込みのみ完了。アップロードはしていません。');
-          } else if (remoteUpdatedAt > knownServerVersion) {
-            if (isLocalDirty()) {
-              saveRemoteConflictBackup(remoteData);
-              updateSyncStatus('⚠️ 同期競合：ローカル変更を保護中', 'text-amber-600');
-              console.warn('[SYNC] サーバー変更とローカル未同期変更が競合。自動上書き停止。');
-            } else {
-              applyRemoteData(remoteData, remoteUpdatedAt);
-              console.log('[SYNC] サーバー変更を検出。読み込みました。');
-            }
-          } else {
-            console.log('[SYNC] サーバー変更なし。読み込みません。');
-          }
+          console.log("[SYNC] サーバーデータを読み込み", { roomId, remoteUpdatedAt });
+          applyRemoteData(remoteData, remoteUpdatedAt);
+          console.log("[SYNC] 初回読み込み完了。初回接続によるpushはしていません。");
         } else {
-          console.log('[SYNC] サーバーにルームなし。初回接続では作成・アップロードしません。');
-          localStorage.setItem(initializedKey, '1');
+          console.log("[SYNC] ルームなし。初回接続では作成・pushしません。");
+          updateSyncStatus('☁️ ルーム待機中（書き込みなし）', 'text-amber-600');
+        }
+
+        syncReady = true;
+
+        if (pendingLocalChange) {
+          pendingLocalChange = false;
+          console.log("[SYNC] 初回同期中にユーザー変更あり → 変更分だけpush");
+          schedulePushToRemote(roomId);
         }
       } catch (e) {
-        console.error('[SYNC] Initial sync error:', e);
-        updateSyncStatus('⚠️ 同期確認エラー（ローカル保存中）', 'text-amber-500');
+        console.error("[SYNC] Initial sync error:", e);
+        syncReady = false;
+        updateSyncStatus('⚠️ 初回読み込み失敗（書き込み停止）', 'text-rose-500');
+        return;
       }
 
-      // Firestoreを監視。変更された時だけ読み込む。監視からpushは絶対にしない。
-      unsubscribeSnapshot = onSnapshot(docRef, (docSnap) => {
-        if (!docSnap.exists() || isSyncing) return;
-        const remoteData = docSnap.data();
-        const remoteUpdatedAt = Number(remoteData.updatedAt || 0);
-        const knownServerVersion = getLastServerVersion();
-        if (remoteUpdatedAt <= knownServerVersion) return;
+      unsubscribeSnapshot = onSnapshot(docRef, (snap) => {
+        if (!snap.exists() || isSyncing) return;
 
-        console.log('[SYNC] サーバー変更検知:', remoteUpdatedAt);
-        if (isLocalDirty()) {
-          saveRemoteConflictBackup(remoteData);
-          updateSyncStatus('⚠️ 同期競合：ローカル変更を保護中', 'text-amber-600');
-          return;
+        const remoteData = snap.data();
+        const remoteUpdatedAt = Number(remoteData.updatedAt || 0);
+        const localUpdatedAt = Number(localStorage.getItem('st_updated_at') || '0');
+
+        console.log("[SYNC] サーバー変更確認", { remoteUpdatedAt, localUpdatedAt });
+
+        if (remoteUpdatedAt > localUpdatedAt) {
+          isSyncing = true;
+          try {
+            console.log("[SYNC] サーバー変更あり → 読み込み");
+            applyRemoteData(remoteData, remoteUpdatedAt);
+          } finally {
+            isSyncing = false;
+          }
         }
-        isSyncing = true;
-        try { applyRemoteData(remoteData, remoteUpdatedAt); }
-        finally { isSyncing = false; }
       }, (error) => {
-        console.error('[SYNC] Snapshot error:', error);
+        console.error("[SYNC] Snapshot error:", error);
         updateSyncStatus('⚠️ 同期エラー (ローカル保存中)', 'text-amber-500');
       });
 
-      updateSyncStatus('✅ 自動同期中 (変更監視)', 'text-emerald-600');
-    }
-
-    function getCurrentLocalData() {
-      return {
-        subjects: window.subjects,
-        logs: window.logs,
-        todos: window.todos,
-        problemLogs: window.problemLogs,
-        dailyGoal: window.dailyGoal,
-        timeSchedules: window.timeSchedules,
-        customScheduleTasks: window.customScheduleTasks,
-        schedulePresets: window.schedulePresets
-      };
-    }
-
-    function saveLocalConflictBackup(reason) {
-      try {
-        localStorage.setItem('st_sync_local_backup', JSON.stringify({ savedAt: Date.now(), reason, data: getCurrentLocalData() }));
-      } catch (e) { console.error('[SYNC] Local backup failed:', e); }
-    }
-
-    function saveRemoteConflictBackup(remoteData) {
-      try {
-        localStorage.setItem('st_sync_conflict_backup', JSON.stringify({ savedAt: Date.now(), remoteData }));
-      } catch (e) { console.error('[SYNC] Remote backup failed:', e); }
+      updateSyncStatus('✅ 自動同期中 (リアルタイム)', 'text-emerald-600');
     }
 
     function applyRemoteData(remoteData, remoteUpdatedAt) {
       const timerSubSelect = document.getElementById('timer-subject-select');
       const currentSelectedSubject = timerSubSelect ? timerSubSelect.value : null;
+
       if (remoteData.subjects) window.subjects = remoteData.subjects;
       if (remoteData.logs) window.logs = remoteData.logs;
       if (remoteData.todos) window.todos = remoteData.todos;
@@ -1180,7 +1171,6 @@
       localStorage.setItem('st_custom_sched_tasks', JSON.stringify(window.customScheduleTasks));
       localStorage.setItem('st_sched_presets', JSON.stringify(window.schedulePresets));
       localStorage.setItem('st_updated_at', String(remoteUpdatedAt));
-      markLocalClean(remoteUpdatedAt);
 
       if (typeof renderSubjectOptions === 'function') renderSubjectOptions();
       if (typeof renderSubjectList === 'function') renderSubjectList();
@@ -1190,74 +1180,113 @@
       if (typeof renderHistoryTable === 'function') renderHistoryTable();
       if (typeof renderCustomScheduleTasksList === 'function') renderCustomScheduleTasksList();
       if (typeof renderSchedulePresetsList === 'function') renderSchedulePresetsList();
-      if (currentSelectedSubject && timerSubSelect) timerSubSelect.value = currentSelectedSubject;
+
+      if (currentSelectedSubject && timerSubSelect) {
+        timerSubSelect.value = currentSelectedSubject;
+      }
     }
 
     async function pushLocalDataToRemote(docRef) {
+      if (!syncReady || isSyncing) {
+        console.log("[SYNC] push拒否: 初回同期未完了または同期中");
+        return false;
+      }
+
       const database = await initFirebase();
-      if (!database || !isLocalDirty()) return false;
+      if (!database) return false;
+
       isSyncing = true;
       try {
-        // 書き込み直前に再確認。別端末の更新を上書きしない。
         const latestSnap = await getDoc(docRef);
-        const latestRemote = latestSnap.exists() ? latestSnap.data() : null;
-        const latestVersion = latestRemote ? Number(latestRemote.updatedAt || 0) : 0;
-        const knownVersion = getLastServerVersion();
-        if (latestRemote && latestVersion > knownVersion) {
-          saveRemoteConflictBackup(latestRemote);
-          updateSyncStatus('⚠️ 同期競合：サーバーを上書きしていません', 'text-amber-600');
-          console.warn('[SYNC] push中止：サーバーに新しい変更があります。');
-          return false;
+
+        if (latestSnap.exists()) {
+          const latestRemote = latestSnap.data();
+          const remoteUpdatedAt = Number(latestRemote.updatedAt || 0);
+          const knownUpdatedAt = Number(localStorage.getItem('st_updated_at') || '0');
+
+          if (remoteUpdatedAt > knownUpdatedAt) {
+            console.warn("[SYNC] push中止: サーバーにより新しいデータがあります");
+            applyRemoteData(latestRemote, remoteUpdatedAt);
+            return false;
+          }
         }
 
-        const now = Math.max(Date.now(), getLocalUpdatedAt() + 1, latestVersion + 1);
-        await setDoc(docRef, { ...getCurrentLocalData(), updatedAt: now });
+        const now = Date.now();
+        await setDoc(docRef, {
+          subjects: window.subjects,
+          logs: window.logs,
+          todos: window.todos,
+          problemLogs: window.problemLogs,
+          dailyGoal: window.dailyGoal,
+          timeSchedules: window.timeSchedules,
+          customScheduleTasks: window.customScheduleTasks,
+          schedulePresets: window.schedulePresets,
+          updatedAt: now
+        });
+
         localStorage.setItem('st_updated_at', String(now));
-        markLocalClean(now);
-        localStorage.setItem('st_sync_initialized_' + (localStorage.getItem('st_sync_room') || ''), '1');
-        console.log('[SYNC] アップロード完了:', now);
-        updateSyncStatus('✅ 自動同期中 (変更監視)', 'text-emerald-600');
+        console.log("[SYNC] push完了:", now);
         return true;
       } catch (e) {
-        console.error('[SYNC] Push remote error:', e);
-        updateSyncStatus('⚠️ アップロード失敗（ローカル保存中）', 'text-amber-500');
+        console.error("[SYNC] Push remote error:", e);
         return false;
-      } finally { isSyncing = false; }
+      } finally {
+        isSyncing = false;
+      }
+    }
+
+    function schedulePushToRemote(roomId) {
+      if (autoSyncTimer) clearTimeout(autoSyncTimer);
+
+      autoSyncTimer = setTimeout(async () => {
+        if (!syncReady || currentSyncRoomId !== roomId) {
+          console.log("[SYNC] pushキャンセル");
+          return;
+        }
+        const database = await initFirebase();
+        if (!database) return;
+        await pushLocalDataToRemote(doc(database, 'rooms', roomId));
+      }, 500);
     }
 
     window.notifyDataChanged = function() {
       const now = Date.now();
       localStorage.setItem('st_updated_at', String(now));
-      markLocalDirty();
-      console.log('[SYNC] ローカル変更:', now);
+
       const roomId = localStorage.getItem('st_sync_room');
       if (!roomId) return;
-      if (autoSyncTimer) clearTimeout(autoSyncTimer);
-      autoSyncTimer = setTimeout(async () => {
-        const database = await initFirebase();
-        if (!database) return;
-        await pushLocalDataToRemote(doc(database, 'rooms', roomId));
-      }, 500);
+
+      if (!syncReady) {
+        pendingLocalChange = true;
+        console.log("[SYNC] 初回同期中の変更を保留。まだpushしません");
+        return;
+      }
+
+      schedulePushToRemote(roomId);
     };
 
     function updateSyncStatus(text, colorClass) {
       const statusText = document.getElementById('sync-status-text');
       const indicator = document.getElementById('sync-status-indicator');
       if (statusText) statusText.innerText = text;
-      if (indicator) indicator.className = `text-xs font-semibold flex items-center gap-1.5 ${colorClass}`;
+      if (indicator) {
+        indicator.className = `text-xs font-semibold flex items-center gap-1.5 ${colorClass}`;
+      }
     }
 
     window.addEventListener('DOMContentLoaded', () => {
       const savedRoom = localStorage.getItem('st_sync_room') || '';
       const roomInput = document.getElementById('sync-room-input');
-      if (roomInput && savedRoom) { roomInput.value = savedRoom; setupRealtimeSync(savedRoom); }
+      if (roomInput && savedRoom) {
+        roomInput.value = savedRoom;
+        setupRealtimeSync(savedRoom);
+      }
     });
 
     window.addEventListener('focus', () => {
       const savedRoom = localStorage.getItem('st_sync_room') || '';
       if (savedRoom) setupRealtimeSync(savedRoom);
     });
-
   </script>
 
   <script>
@@ -1565,66 +1594,18 @@
 
     function handleTimerSubjectChange(newSubId) {}
 
-    function unlockAudio() {
-      const audio = document.getElementById('alarm-sound');
-      if (!audio) return;
-
-      // This function is called directly from the user's tap on "開始".
-      // Start the same audio element once during the user gesture, then stop it.
-      // volume=0 avoids an audible test sound while still using the user's gesture.
-      const previousVolume = audio.volume;
-      const previousMuted = audio.muted;
-      audio.volume = 0;
-      audio.muted = false;
-
-      const p = audio.play();
-      if (p && typeof p.then === 'function') {
-        p.then(() => {
-          audio.pause();
-          audio.currentTime = 0;
-          audio.volume = previousVolume;
-          audio.muted = previousMuted;
-          console.log("Audio unlocked");
-        }).catch(e => {
-          audio.volume = previousVolume;
-          audio.muted = previousMuted;
-          console.log("Audio unlock failed:", e);
-        });
-      } else {
-        audio.pause();
-        audio.currentTime = 0;
-        audio.volume = previousVolume;
-        audio.muted = previousMuted;
-      }
-    }
-
     function playAlarmSound() {
       const audio = document.getElementById('alarm-sound');
-      if (!audio) return;
-
-      // Do not mute/pause/reset the audio anywhere during an automatic
-      // Pomodoro transition. Only this function controls the alarm playback.
-      audio.muted = false;
-      audio.volume = 1;
-      audio.currentTime = 0;
-
-      if (alarmTimeout) {
-        clearTimeout(alarmTimeout);
-        alarmTimeout = null;
-      }
-
-      const playPromise = audio.play();
-      if (playPromise && typeof playPromise.catch === 'function') {
-        playPromise.catch(e => {
-          console.log("Audio play blocked or missing:", e);
-        });
-      }
-
-      alarmTimeout = setTimeout(() => {
-        audio.pause();
+      if (audio) {
         audio.currentTime = 0;
-        alarmTimeout = null;
-      }, 5000);
+        audio.play().catch(e => console.log("Audio play blocked or missing:", e));
+        
+        if (alarmTimeout) clearTimeout(alarmTimeout);
+        alarmTimeout = setTimeout(() => {
+          audio.pause();
+          audio.currentTime = 0;
+        }, 5000);
+      }
     }
 
     function updateSaveButtonState() {
@@ -1640,10 +1621,9 @@
       }
     }
 
-    function startTimer(fromUser = true) {
-      if (fromUser) unlockAudio();
+    function startTimer() {
       if (isTimerRunning) return;
-
+      
       if (timerMode === 'alarm') {
         updateAlarmTimerTarget();
         if (timerSeconds <= 0) {
@@ -1676,14 +1656,12 @@
           } else {
             if (timerSeconds > 0) timerSeconds--;
           }
-
+          
           if (currentSubId !== 'break') {
             subjectElapsedSeconds[currentSubId] = (subjectElapsedSeconds[currentSubId] || 0) + 1;
           }
 
           if (timerSeconds <= 0) {
-            timerSeconds = 0;
-            updateTimerDisplay();
             playAlarmSound();
             pauseTimer();
             showToast('アラーム時刻になりました！自動で記録を保存します');
@@ -1691,63 +1669,39 @@
             return;
           }
         } else {
-          // Pomodoro
           if (timerSeconds > 0) {
             timerSeconds--;
             if (loopState === 'work' && currentSubId !== 'break') {
               subjectElapsedSeconds[currentSubId] = (subjectElapsedSeconds[currentSubId] || 0) + 1;
             }
           }
-
-          if (timerSeconds <= 0) {
-            // Make the completed phase explicitly reach 00:00:00 before switching.
-            timerSeconds = 0;
-            updateTimerDisplay();
-            renderLapList();
-            updateSaveButtonState();
-
+          if (timerSeconds === 0) {
             playAlarmSound();
-
-            // Stop the current interval before starting the next Pomodoro phase.
-            isTimerRunning = false;
-            clearInterval(timerInterval);
-            timerInterval = null;
-
             if (loopState === 'work') {
               saveTimerSessionAuto(false);
-
               if (pomoBreakMin > 0) {
                 loopState = 'break';
                 timerSeconds = pomoBreakMin * 60;
                 document.getElementById('timer-loop-status').innerText = `☕ 休憩タイム (${currentSet} / ${totalSets}セット)`;
                 showToast('集中タイム終了！休憩に入ります。');
-
-                // Start automatically; do NOT run audio unlock again.
-                startTimer(false);
+                startTimer();
                 return;
               }
             }
-
             if (currentSet < totalSets) {
               currentSet++;
               loopState = 'work';
               timerSeconds = pomoWorkMin * 60;
               document.getElementById('timer-loop-status').innerText = `🔥 集中タイム (${currentSet} / ${totalSets}セット)`;
               showToast(`セット ${currentSet} を開始します！`);
-
-              // Start automatically; do NOT run audio unlock again.
-              startTimer(false);
+              startTimer();
             } else {
-              // Final Pomodoro phase: leave the timer at 00:00:00.
               pauseTimer();
-              timerSeconds = 0;
-              updateTimerDisplay();
               showToast('すべてのセットが完了しました！お疲れ様でした！');
             }
             return;
           }
         }
-
         updateTimerDisplay();
         renderLapList();
         updateSaveButtonState();
@@ -1755,11 +1709,9 @@
     }
 
     function pauseTimer() {
-      if (timerInterval) {
-        clearInterval(timerInterval);
-        timerInterval = null;
-      }
+      if (!isTimerRunning) return;
       isTimerRunning = false;
+      clearInterval(timerInterval);
 
       document.getElementById('start-btn').classList.remove('hidden');
       document.getElementById('pause-btn').classList.add('hidden');
@@ -3467,14 +3419,5 @@
       }, 3000);
     }
   </script>
-<script>
-if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => {
-    navigator.serviceWorker.register("./sw.js").catch(error => {
-      console.log("Service Worker registration failed:", error);
-    });
-  });
-}
-</script>
 </body>
 </html>
