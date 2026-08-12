@@ -1198,17 +1198,12 @@
       return result;
     }
 
-    function mergeRemoteIntoLocal(remoteData, remoteUpdatedAt) {
+    function mergeRemoteIntoLocal(remoteData) {
       const base = getSyncBase();
-
-      // baseがない古いデータでは危険な自動マージをしない
-      if (!base) {
-        console.warn("[SYNC] merge用のbaseがありません。競合として保護します。");
-        return false;
-      }
+      if (!base) return null;
 
       const local = getCurrentData();
-      const merged = mergeValue(base, local, {
+      const remote = {
         subjects: remoteData.subjects ?? [],
         logs: remoteData.logs ?? [],
         todos: remoteData.todos ?? [],
@@ -1217,13 +1212,15 @@
         timeSchedules: remoteData.timeSchedules ?? [],
         customScheduleTasks: remoteData.customScheduleTasks ?? [],
         schedulePresets: remoteData.schedulePresets ?? {}
-      });
+      };
+
+      const merged = mergeValue(base, local, remote);
 
       window.subjects = merged.subjects || [];
       window.logs = merged.logs || [];
       window.todos = merged.todos || [];
       window.problemLogs = merged.problemLogs || [];
-      window.dailyGoal = merged.dailyGoal ?? window.dailyGoal;
+      if (merged.dailyGoal !== undefined) window.dailyGoal = merged.dailyGoal;
       window.timeSchedules = merged.timeSchedules || [];
       window.customScheduleTasks = merged.customScheduleTasks || [];
       window.schedulePresets = merged.schedulePresets || {};
@@ -1247,192 +1244,30 @@
       if (typeof renderCustomScheduleTasksList === 'function') renderCustomScheduleTasksList();
       if (typeof renderSchedulePresetsList === 'function') renderSchedulePresetsList();
 
-      // merge結果にはlocal変更が残っているのでdirtyを維持し、push可能にする
       markLocalDirty();
-      console.log("[SYNC] A/Bの変更を統合しました。統合結果をpushします。");
-      return true;
+      return merged;
     }
 
-    async function initFirebase() {
-      if (db) return db;
-      try {
-        const app = initializeApp(netlifyFirebaseConfig);
-        auth = getAuth(app);
-        db = getFirestore(app);
-        await signInAnonymously(auth);
-        return db;
-      } catch (e) {
-        console.error("[SYNC] Firebase init error:", e);
-        return null;
-      }
-    }
-
-    window.updateSyncRoom = function(roomId) {
-      roomId = roomId.trim();
-      syncReady = false;
-      pendingLocalChange = false;
-      currentSyncRoomId = roomId;
-
-      if (autoSyncTimer) {
-        clearTimeout(autoSyncTimer);
-        autoSyncTimer = null;
-      }
-
-      localStorage.setItem('st_sync_room', roomId);
-
-      if (unsubscribeSnapshot) {
-        unsubscribeSnapshot();
-        unsubscribeSnapshot = null;
-      }
-
-      if (roomId) {
-        setupRealtimeSync(roomId);
-      } else {
-        updateSyncStatus('ローカル保存稼働中', 'text-emerald-600');
-      }
-    };
-
-    async function setupRealtimeSync(roomId) {
-      const database = await initFirebase();
-      if (!database) {
-        updateSyncStatus('❌ クラウド接続エラー（ローカル保存中）', 'text-rose-500');
-        return;
-      }
-
-      syncReady = false;
-      pendingLocalChange = false;
-      currentSyncRoomId = roomId;
-
-      if (unsubscribeSnapshot) {
-        unsubscribeSnapshot();
-        unsubscribeSnapshot = null;
-      }
-
-      updateSyncStatus('☁️ サーバー状態を確認中...', 'text-indigo-500');
-      console.log("[SYNC] 接続。dirty =", isLocalDirty());
-
-      const docRef = doc(database, 'rooms', roomId);
-
-      try {
-        const docSnap = await getDoc(docRef);
-
-        if (docSnap.exists()) {
-          const remoteData = docSnap.data();
-          const remoteUpdatedAt = Number(remoteData.updatedAt || 0);
-          const lastServerVersion = Number(
-            localStorage.getItem('st_sync_server_version') || '0'
-          );
-          const dirty = isLocalDirty();
-
-          if (!dirty) {
-            applyRemoteData(remoteData, remoteUpdatedAt);
-            console.log("[SYNC] 未送信変更なし → サーバーを読み込み");
-          } else if (remoteUpdatedAt === lastServerVersion) {
-            console.log("[SYNC] オフライン変更あり。競合なし → ローカルをpush");
-            syncReady = true;
-            await pushLocalDataToRemote(docRef);
-          } else if (remoteUpdatedAt > lastServerVersion) {
-            // Aがオンライン中に変更、Bがオフライン中に変更したケース
-            console.log("[SYNC] A/B双方に変更あり → 3-way merge開始");
-            syncReady = true;
-
-            if (mergeRemoteIntoLocal(remoteData, remoteUpdatedAt)) {
-              await pushLocalDataToRemote(docRef);
-            } else {
-              updateSyncStatus('⚠️ 競合を保護しました', 'text-amber-600');
-            }
-          } else {
-            console.warn("[SYNC] サーバー版数が不整合。自動上書きしません");
-            updateSyncStatus('⚠️ 同期状態を確認してください', 'text-amber-600');
-          }
-        } else {
-          if (isLocalDirty()) {
-            console.log("[SYNC] ルームなし + 実際のローカル変更あり → ルーム作成");
-            syncReady = true;
-            await pushLocalDataToRemote(docRef);
-          } else {
-            console.log("[SYNC] ルームなし + 変更なし → 書き込みしない");
-            updateSyncStatus('☁️ ルーム待機中（書き込みなし）', 'text-amber-600');
-          }
-        }
-
-        syncReady = true;
-      } catch (e) {
-        console.error("[SYNC] Initial sync error:", e);
-        syncReady = false;
-        updateSyncStatus('⚠️ 接続失敗（ローカル保存中）', 'text-rose-500');
-        return;
-      }
-
-      unsubscribeSnapshot = onSnapshot(docRef, async (snap) => {
-        if (!snap.exists() || isSyncing) return;
-
-        const remoteData = snap.data();
-        const remoteUpdatedAt = Number(remoteData.updatedAt || 0);
-
-        if (!isLocalDirty()) {
-          const localServerVersion = Number(
-            localStorage.getItem('st_sync_server_version') || '0'
-          );
-
-          if (remoteUpdatedAt > localServerVersion) {
-            isSyncing = true;
-            try {
-              console.log("[SYNC] サーバー側に変更あり → 読み込み");
-              applyRemoteData(remoteData, remoteUpdatedAt);
-            } finally {
-              isSyncing = false;
-            }
-          }
-        } else {
-          const localServerVersion = Number(
-            localStorage.getItem('st_sync_server_version') || '0'
-          );
-
-          if (remoteUpdatedAt > localServerVersion) {
-            // 未送信変更中に他端末が変更した場合も3-way merge
-            isSyncing = true;
-            try {
-              console.log("[SYNC] リアルタイム競合 → 3-way merge");
-              if (mergeRemoteIntoLocal(remoteData, remoteUpdatedAt)) {
-                await pushLocalDataToRemote(docRef);
-              }
-            } finally {
-              isSyncing = false;
-            }
-          }
-        }
-      }, (error) => {
-        console.error("[SYNC] Snapshot error:", error);
-        updateSyncStatus('⚠️ 同期エラー（ローカル保存中）', 'text-amber-500');
+    async function forcePushMergedData(docRef, mergedData) {
+      const now = Date.now();
+      await setDoc(docRef, {
+        subjects: mergedData.subjects || [],
+        logs: mergedData.logs || [],
+        todos: mergedData.todos || [],
+        problemLogs: mergedData.problemLogs || [],
+        dailyGoal: mergedData.dailyGoal,
+        timeSchedules: mergedData.timeSchedules || [],
+        customScheduleTasks: mergedData.customScheduleTasks || [],
+        schedulePresets: mergedData.schedulePresets || {},
+        updatedAt: now
       });
 
-      updateSyncStatus(
-        isLocalDirty() ? '☁️ 変更を統合・保存中...' : '✅ 自動同期中 (リアルタイム)',
-        isLocalDirty() ? 'text-indigo-500' : 'text-emerald-600'
-      );
+      markLocalClean(now, mergedData);
+      console.log("[SYNC] MERGED PUSH SUCCESS", now);
+      updateSyncStatus('☁️ A/Bの変更を統合して保存しました', 'text-emerald-600');
     }
 
-    function applyRemoteData(remoteData, remoteUpdatedAt) {
-      const timerSubSelect = document.getElementById('timer-subject-select');
-      const currentSelectedSubject = timerSubSelect ? timerSubSelect.value : null;
-
-      const normalized = {
-        subjects: remoteData.subjects ?? [],
-        logs: remoteData.logs ?? [],
-        todos: remoteData.todos ?? [],
-        problemLogs: remoteData.problemLogs ?? [],
-        dailyGoal: remoteData.dailyGoal,
-        timeSchedules: remoteData.timeSchedules ?? [],
-        customScheduleTasks: remoteData.customScheduleTasks ?? [],
-        schedulePresets: remoteData.schedulePresets ?? {}
-      };
-
-      window.subjects = normalized.subjects;
-      window.logs = normalized.logs;
-      window.todos = normalized.todos;
-      window.problemLogs = normalized.problemLogs;
-      if (normalized.dailyGoal !== undefined) window.dailyGoal = normalized.dailyGoal;
+al !== undefined) window.dailyGoal = normalized.dailyGoal;
       window.timeSchedules = normalized.timeSchedules;
       window.customScheduleTasks = normalized.customScheduleTasks;
       window.schedulePresets = normalized.schedulePresets;
@@ -1464,58 +1299,40 @@
     }
 
     async function pushLocalDataToRemote(docRef) {
-      if (!syncReady || isSyncing) {
-        console.log("[SYNC] push拒否: 同期準備未完了または同期中");
-        return false;
-      }
+      if (!syncReady || isSyncing) return false;
 
       const database = await initFirebase();
       if (!database) return false;
 
       isSyncing = true;
-
       try {
         const latestSnap = await getDoc(docRef);
-        const knownServerVersion = Number(
-          localStorage.getItem('st_sync_server_version') || '0'
-        );
+        const knownServerVersion = Number(localStorage.getItem('st_sync_server_version') || '0');
 
         if (latestSnap.exists()) {
           const latestRemote = latestSnap.data();
-          const remoteUpdatedAt = Number(latestRemote.updatedAt || 0);
+          const remoteVersion = Number(latestRemote.updatedAt || 0);
 
-          if (remoteUpdatedAt !== knownServerVersion) {
-            // push直前に別端末の変更を検出したら、もう一度3-way merge
-            console.log("[SYNC] push直前に競合検出 → merge");
-            const merged = mergeRemoteIntoLocal(latestRemote, remoteUpdatedAt);
-
-            if (!merged) {
-              updateSyncStatus('⚠️ 競合を保護しました', 'text-amber-600');
-              return false;
-            }
+          if (remoteVersion !== knownServerVersion) {
+            console.log("[SYNC] push直前競合 → 3-way merge");
+            const merged = mergeRemoteIntoLocal(latestRemote);
+            if (!merged) return false;
+            await forcePushMergedData(docRef, merged);
+            return true;
           }
         } else if (knownServerVersion !== 0) {
-          console.warn("[SYNC] 以前存在したサーバールームが見つかりません。push停止");
           updateSyncStatus('⚠️ サーバーデータ消失を検出（書き込み停止）', 'text-rose-600');
           return false;
         }
 
-        const now = Date.now();
         const data = getCurrentData();
-
-        await setDoc(docRef, {
-          ...data,
-          updatedAt: now
-        });
-
-        localStorage.setItem('st_updated_at', String(now));
+        const now = Date.now();
+        await setDoc(docRef, {...data, updatedAt: now});
         markLocalClean(now, data);
-
-        console.log("[SYNC] 統合データをpush完了:", now);
-        updateSyncStatus('☁️ 統合・保存完了', 'text-emerald-600');
+        updateSyncStatus('☁️ 保存完了', 'text-emerald-600');
         return true;
       } catch (e) {
-        console.error("[SYNC] Push failed。ローカル変更を保持:", e);
+        console.error("[SYNC] Push failed:", e);
         markLocalDirty();
         updateSyncStatus('📴 変更を保持中', 'text-amber-600');
         return false;
