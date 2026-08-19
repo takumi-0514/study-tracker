@@ -1734,18 +1734,100 @@
 
     function handleTimerSubjectChange(newSubId) {}
 
+    // iPhone/iPad Safari/PWA対策:
+    // 「開始」ボタンのユーザー操作中に、実際に使用する同じaudio要素を
+    // 一度再生しておき、後のタイマー終了時のplay()を許可されやすくする。
+    let audioUnlocked = false;
+
+    function unlockAudio() {
+      const audio = document.getElementById('alarm-sound');
+      if (!audio) {
+        console.warn("[AUDIO] #alarm-sound が見つかりません");
+        return;
+      }
+
+      audio.preload = 'auto';
+      audio.muted = false;
+
+      // ユーザー操作中に再生開始することが重要。
+      // 音量を0にしているだけで muted=true にはしない。
+      const oldVolume = audio.volume;
+      const oldTime = audio.currentTime;
+
+      audio.volume = 0;
+
+      try {
+        const p = audio.play();
+
+        if (p && typeof p.then === 'function') {
+          p.then(() => {
+            audio.pause();
+            audio.currentTime = oldTime || 0;
+            audio.volume = oldVolume;
+            audioUnlocked = true;
+            console.log("[AUDIO] iOS/Safari audio unlocked");
+          }).catch(err => {
+            audio.volume = oldVolume;
+            console.warn("[AUDIO] audio unlock failed:", err);
+          });
+        } else {
+          audio.pause();
+          audio.currentTime = oldTime || 0;
+          audio.volume = oldVolume;
+          audioUnlocked = true;
+        }
+      } catch (err) {
+        audio.volume = oldVolume;
+        console.warn("[AUDIO] audio unlock exception:", err);
+      }
+    }
+
     function playAlarmSound() {
       const audio = document.getElementById('alarm-sound');
-      if (audio) {
-        audio.currentTime = 0;
-        audio.play().catch(e => console.log("Audio play blocked or missing:", e));
-        
-        if (alarmTimeout) clearTimeout(alarmTimeout);
-        alarmTimeout = setTimeout(() => {
-          audio.pause();
-          audio.currentTime = 0;
-        }, 5000);
+      if (!audio) {
+        console.warn("[AUDIO] #alarm-sound が見つかりません");
+        return;
       }
+
+      if (alarmTimeout) {
+        clearTimeout(alarmTimeout);
+        alarmTimeout = null;
+      }
+
+      audio.muted = false;
+      audio.volume = 1;
+      audio.currentTime = 0;
+
+      console.log("[AUDIO] alarm play", {
+        unlocked: audioUnlocked,
+        readyState: audio.readyState
+      });
+
+      const p = audio.play();
+
+      if (p && typeof p.then === 'function') {
+        p.catch(e => {
+          console.warn("[AUDIO] alarm play blocked:", e);
+          // Safariで読み込みが間に合っていない場合に一度だけ再試行。
+          try {
+            audio.load();
+            audio.currentTime = 0;
+            audio.play().catch(err2 => {
+              console.warn("[AUDIO] alarm retry failed:", err2);
+            });
+          } catch (retryErr) {
+            console.warn("[AUDIO] alarm retry exception:", retryErr);
+          }
+        });
+      }
+
+      alarmTimeout = setTimeout(() => {
+        audio.pause();
+        audio.currentTime = 0;
+        audio.volume = 1;
+        audio.muted = false;
+        alarmTimeout = null;
+      }, 5000);
     }
 
     function updateSaveButtonState() {
@@ -1761,7 +1843,8 @@
       }
     }
 
-    function startTimer() {
+    function startTimer(fromUser = true) {
+      if (fromUser) unlockAudio();
       if (isTimerRunning) return;
       
       if (timerMode === 'alarm') {
