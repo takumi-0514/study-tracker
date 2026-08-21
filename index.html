@@ -1735,50 +1735,39 @@
     function handleTimerSubjectChange(newSubId) {}
 
     // iPhone/iPad Safari/PWA対策:
-    // 「開始」ボタンのユーザー操作中に、実際に使用する同じaudio要素を
-    // 一度再生しておき、後のタイマー終了時のplay()を許可されやすくする。
+    // 無音のaudioをタイマー中ずっと再生する方式は使わない。
+    // 開始ボタンのユーザー操作中にAudioContextだけをresumeし、
+    // アラーム時にだけMP3を再生する。
     let audioUnlocked = false;
+    let alarmAudioContext = null;
 
     function unlockAudio() {
-      const audio = document.getElementById('alarm-sound');
-      if (!audio) {
-        console.warn("[AUDIO] #alarm-sound が見つかりません");
-        return;
-      }
-
-      audio.preload = 'auto';
-      audio.muted = false;
-
-      // ユーザー操作中に再生開始することが重要。
-      // 音量を0にしているだけで muted=true にはしない。
-      const oldVolume = audio.volume;
-      const oldTime = audio.currentTime;
-
-      audio.volume = 0;
-
       try {
-        const p = audio.play();
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 
-        if (p && typeof p.then === 'function') {
-          p.then(() => {
-            audio.pause();
-            audio.currentTime = oldTime || 0;
-            audio.volume = oldVolume;
+        if (AudioContextClass) {
+          if (!alarmAudioContext) alarmAudioContext = new AudioContextClass();
+
+          const p = alarmAudioContext.resume();
+          if (p && typeof p.then === 'function') {
+            p.then(() => {
+              audioUnlocked = true;
+              console.log("[AUDIO] AudioContext unlocked:", alarmAudioContext.state);
+            }).catch(err => console.warn("[AUDIO] AudioContext resume failed:", err));
+          } else {
             audioUnlocked = true;
-            console.log("[AUDIO] iOS/Safari audio unlocked");
-          }).catch(err => {
-            audio.volume = oldVolume;
-            console.warn("[AUDIO] audio unlock failed:", err);
-          });
-        } else {
-          audio.pause();
-          audio.currentTime = oldTime || 0;
-          audio.volume = oldVolume;
-          audioUnlocked = true;
+          }
+        }
+
+        const audio = document.getElementById('alarm-sound');
+        if (audio) {
+          audio.preload = 'auto';
+          audio.muted = false;
+          audio.volume = 1;
+          try { audio.load(); } catch (_) {}
         }
       } catch (err) {
-        audio.volume = oldVolume;
-        console.warn("[AUDIO] audio unlock exception:", err);
+        console.warn("[AUDIO] unlock exception:", err);
       }
     }
 
@@ -1796,25 +1785,35 @@
 
       audio.muted = false;
       audio.volume = 1;
-      audio.currentTime = 0;
+      audio.loop = false;
+      try { audio.currentTime = 0; } catch (_) {}
+
+      if (alarmAudioContext && alarmAudioContext.state === 'suspended') {
+        alarmAudioContext.resume().catch(err =>
+          console.warn("[AUDIO] resume at alarm failed:", err)
+        );
+      }
 
       console.log("[AUDIO] alarm play", {
         unlocked: audioUnlocked,
+        audioContextState: alarmAudioContext ? alarmAudioContext.state : 'none',
         readyState: audio.readyState
       });
 
       const p = audio.play();
 
       if (p && typeof p.then === 'function') {
-        p.catch(e => {
+        p.then(() => {
+          audioUnlocked = true;
+          console.log("[AUDIO] alarm started");
+        }).catch(e => {
           console.warn("[AUDIO] alarm play blocked:", e);
-          // Safariで読み込みが間に合っていない場合に一度だけ再試行。
           try {
             audio.load();
             audio.currentTime = 0;
-            audio.play().catch(err2 => {
-              console.warn("[AUDIO] alarm retry failed:", err2);
-            });
+            audio.play().catch(err2 =>
+              console.warn("[AUDIO] alarm retry failed:", err2)
+            );
           } catch (retryErr) {
             console.warn("[AUDIO] alarm retry exception:", retryErr);
           }
@@ -1826,8 +1825,25 @@
         audio.currentTime = 0;
         audio.volume = 1;
         audio.muted = false;
+        audio.loop = false;
         alarmTimeout = null;
       }, 5000);
+    }
+
+    function stopAlarmAudio() {
+      const audio = document.getElementById('alarm-sound');
+      if (!audio) return;
+
+      if (alarmTimeout) {
+        clearTimeout(alarmTimeout);
+        alarmTimeout = null;
+      }
+
+      audio.pause();
+      audio.currentTime = 0;
+      audio.volume = 1;
+      audio.muted = false;
+      audio.loop = false;
     }
 
     function updateSaveButtonState() {
@@ -1907,7 +1923,7 @@
                 timerSeconds = pomoBreakMin * 60;
                 document.getElementById('timer-loop-status').innerText = `☕ 休憩タイム (${currentSet} / ${totalSets}セット)`;
                 showToast('集中タイム終了！休憩に入ります。');
-                startTimer();
+                updateTimerDisplay();
                 return;
               }
             }
@@ -1917,7 +1933,7 @@
               timerSeconds = pomoWorkMin * 60;
               document.getElementById('timer-loop-status').innerText = `🔥 集中タイム (${currentSet} / ${totalSets}セット)`;
               showToast(`セット ${currentSet} を開始します！`);
-              startTimer();
+              updateTimerDisplay();
             } else {
               pauseTimer();
               showToast('すべてのセットが完了しました！お疲れ様でした！');
@@ -1933,6 +1949,7 @@
 
     function pauseTimer() {
       if (!isTimerRunning) return;
+      stopAlarmAudio();
       isTimerRunning = false;
       clearInterval(timerInterval);
 
